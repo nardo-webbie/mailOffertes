@@ -44,6 +44,11 @@ SCOPE_USER = os.environ["SCOPE_USER"]
 SCOPE_PASSWORD = os.environ["SCOPE_PASSWORD"]
 SCOPE_ORGANIZATION_CODE = os.environ.get("SCOPE_ORGANIZATION_CODE")
 SCOPE_LEGAL_ENTITY_CODE = os.environ.get("SCOPE_LEGAL_ENTITY_CODE")
+# Partnercode die als "owner" (eigenaar/vestiging) van elke aangemaakte
+# offerte gebruikt wordt -- Scope eist dit veld ("Quotation's owner must be
+# supplied"). Standaard SCORTM; override met de env-var/secret
+# SCOPE_OWNER_PARTNER_CODE als dat ooit een andere code moet zijn.
+SCOPE_OWNER_PARTNER_CODE = os.environ.get("SCOPE_OWNER_PARTNER_CODE", "SCORTM")
 
 TURSO_DATABASE_URL = os.environ["TURSO_DATABASE_URL"]
 TURSO_AUTH_TOKEN = os.environ["TURSO_AUTH_TOKEN"]
@@ -218,6 +223,38 @@ def scope_get(path, params=None):
     )
     r.raise_for_status()
     return r.json()
+
+
+_owner_identifier_cache = {}
+
+
+def find_partner_by_code(code):
+    """Exacte lookup via de Partner-API's 'code'-parameter (i.t.t.
+    find_partner_by_text hieronder, dat alleen client-side op naam matcht).
+    Gebruikt voor SCOPE_OWNER_PARTNER_CODE ('owner.identifier' -- Scope eist
+    dit veld op elke offerte)."""
+    if code in _owner_identifier_cache:
+        return _owner_identifier_cache[code]
+    try:
+        data = scope_get(
+            "v4/partners",
+            params={
+                "organizationCode": SCOPE_ORGANIZATION_CODE,
+                "legalEntityCode": SCOPE_LEGAL_ENTITY_CODE,
+                "code": code,
+            },
+        )
+    except requests.RequestException as e:
+        print(f"  partner-lookup (code={code}) faalde:", e)
+        return None
+
+    items = data if isinstance(data, list) else data.get("partner") or data.get("partners") or []
+    if not items:
+        print(f"  partner met code {code!r} niet gevonden via Partner-API")
+        return None
+    identifier = items[0].get("identifier")
+    _owner_identifier_cache[code] = identifier
+    return identifier
 
 
 def find_partner_by_text(search_text):
@@ -503,6 +540,17 @@ def main():
         summary = quotation_json.pop("_shipment_summary", None)
         quotation_json["_customer_name_guess"] = customer_guess  # blijft in ons record, niet naar Scope
         payload_for_scope = {k: v for k, v in quotation_json.items() if not k.startswith("_")}
+
+        # Owner is verplicht ("Quotation's owner must be supplied") -- Scope
+        # koppelt dit aan de partnercode SCOPE_OWNER_PARTNER_CODE (SCORTM).
+        try:
+            owner_id = find_partner_by_code(SCOPE_OWNER_PARTNER_CODE)
+            if owner_id:
+                payload_for_scope["owner"] = {"identifier": owner_id}
+            else:
+                print(f"  WAARSCHUWING: geen identifier gevonden voor owner-partnercode {SCOPE_OWNER_PARTNER_CODE!r}; Scope zal deze offerte waarschijnlijk afwijzen.")
+        except Exception as e:  # noqa: BLE001
+            print("  owner-lookup faalde (niet fataal, maar Scope zal waarschijnlijk afwijzen):", e)
 
         # Best-effort aanvullen van bekende klant/verkoper.
         try:
