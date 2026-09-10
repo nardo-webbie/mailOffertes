@@ -85,6 +85,11 @@ class Gmail:
             },
             timeout=30,
         )
+        if resp.status_code >= 400:
+            # Print Google's actual error (invalid_client / invalid_grant / ...)
+            # zodat de Actions-log meteen zegt welk secret fout staat, in
+            # plaats van alleen "400 Bad Request".
+            print("Gmail token-refresh mislukt:", resp.status_code, resp.text, file=sys.stderr)
         resp.raise_for_status()
         self._access_token = resp.json()["access_token"]
 
