@@ -404,7 +404,13 @@ def get_turso_client():
 def ensure_schema(client):
     here = os.path.dirname(os.path.abspath(__file__))
     sql = open(os.path.join(here, "schema.sql")).read()
-    for stmt in [s.strip() for s in sql.split(";") if s.strip() and not s.strip().startswith("--")]:
+    # Verwijder eerst alle losse commentaarregels (-- ...), pas dan op ';'
+    # splitsen -- anders wordt een hele CREATE TABLE overgeslagen zodra er
+    # een commentaarregel vóór staat (de vorige aanpak checkte alleen of de
+    # HELE statement met "--" begon, in plaats van commentaar weg te snijden).
+    lines = [ln for ln in sql.splitlines() if not ln.strip().startswith("--")]
+    cleaned = "\n".join(lines)
+    for stmt in [s.strip() for s in cleaned.split(";") if s.strip()]:
         client.execute(stmt)
 
 
