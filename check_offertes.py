@@ -286,7 +286,8 @@ def resolve_partner_for_email(turso, email_address):
     # functie de rij hierna consistent kan indexeren ongeacht welke van de
     # twee paden 'm vond.
     cols = "email_address, scope_partner_code, scope_partner_identifier"
-    rs = turso.execute(
+    rs = turso_exec(
+        turso,
         f"SELECT {cols} FROM email_partner_map WHERE lower(trim(email_address)) = trim(?)",
         [email_address],
     )
@@ -296,7 +297,7 @@ def resolve_partner_for_email(turso, email_address):
         # Nog steeds niks -- val terug op alle rijen ophalen en in Python
         # normaliseren/vergelijken, en log precies wat er in de tabel staat
         # zodat een eventuele mismatch (rare tekens, typo) meteen zichtbaar is.
-        all_rows = turso.execute(f"SELECT {cols} FROM email_partner_map")
+        all_rows = turso_exec(turso, f"SELECT {cols} FROM email_partner_map")
         print(f"  debug: {len(all_rows.rows)} rij(en) in email_partner_map, "
               f"zoek naar {email_address!r}: " +
               ", ".join(repr(r[0]) for r in all_rows.rows[:10]))
@@ -316,7 +317,8 @@ def resolve_partner_for_email(turso, email_address):
 
     identifier = find_partner_by_code(code)
     if identifier:
-        turso.execute(
+        turso_exec(
+            turso,
             "UPDATE email_partner_map SET scope_partner_identifier = ?, updated_at = ? "
             "WHERE lower(email_address) = ?",
             [identifier, now_iso(), email_address],
@@ -508,6 +510,23 @@ def get_turso_client():
     return libsql_client.create_client_sync(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
 
 
+def turso_exec(client, sql, args=None):
+    """Wrapper om client.execute() heen die de ECHTE Turso-foutmelding laat
+    zien i.p.v. een kale 'KeyError: result'.
+
+    Uitgezocht (bron van libsql_client 0.3.1 zelf gelezen): de execute() van
+    de HTTP-client (het /v1/execute-endpoint) doet gewoon `response["result"]` --
+    als de server een statement-fout teruggeeft (bijv. een constraint- of
+    syntaxfout) staat er geen "result" maar een "error" in de JSON, en crasht
+    de library met een kale KeyError i.p.v. een nette foutmelding. batch()
+    controleert het antwoord WEL netjes (checkt "step_errors" en gooit een
+    LibsqlError met de echte reden) -- dus we sturen alle writes via batch()
+    met precies 1 statement. Functioneel identiek aan execute(), maar nu
+    krijgen we bij een fout de daadwerkelijke Turso-foutmelding te zien
+    (SQLITE_CONSTRAINT, syntaxfout, etc.) i.p.v. een onbegrijpelijke KeyError."""
+    return client.batch([(sql, args)])[0]
+
+
 def ensure_schema(client):
     here = os.path.dirname(os.path.abspath(__file__))
     sql = open(os.path.join(here, "schema.sql")).read()
@@ -518,50 +537,69 @@ def ensure_schema(client):
     lines = [ln for ln in sql.splitlines() if not ln.strip().startswith("--")]
     cleaned = "\n".join(lines)
     for stmt in [s.strip() for s in cleaned.split(";") if s.strip()]:
-        client.execute(stmt)
+        turso_exec(client, stmt)
 
 
 def save_success(client, msg, quotation_id, external_id, request_payload, response_json):
-    client.execute(
-        "INSERT INTO quotations (gmail_message_id, gmail_thread_id, email_subject, email_from, "
-        "email_date, scope_quotation_identifier, scope_external_identifier, customer_name, "
-        "departure, destination, shipment_type, request_json, response_json, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(gmail_message_id) DO NOTHING",
-        [
-            msg["id"],
-            msg.get("threadId"),
-            get_header(msg, "Subject"),
-            get_header(msg, "From"),
-            get_header(msg, "Date"),
-            quotation_id,
-            external_id,
-            request_payload.get("_customer_name_guess"),
-            json.dumps(request_payload.get("general", {}).get("departure", {}), ensure_ascii=False),
-            json.dumps(request_payload.get("general", {}).get("destination", {}), ensure_ascii=False),
-            request_payload.get("shipmentType"),
-            json.dumps(request_payload, ensure_ascii=False),
-            json.dumps(response_json, ensure_ascii=False),
-            now_iso(),
-        ],
-    )
+    """Slaat de offerte op in Turso. Als dit faalt (Turso-hik, netwerk, etc.)
+    wordt de fout alleen GELOGD, niet doorgegooid: de offerte is namelijk al
+    aangemaakt in Scope (niet meer terug te draaien), dus als we hier zouden
+    crashen blijft de mail ongelabeld en wordt 'ie bij de volgende run
+    opnieuw verwerkt -- met een DUBBELE offerte in Scope tot gevolg. Beter
+    één offerte die (tijdelijk) niet in Turso staat dan een duplicaat in
+    Scope. Bij zo'n waarschuwing: offerte handmatig in Turso natrekken/
+    toevoegen aan de hand van het genoemde scope_quotation_identifier."""
+    try:
+        turso_exec(
+            client,
+            "INSERT INTO quotations (gmail_message_id, gmail_thread_id, email_subject, email_from, "
+            "email_date, scope_quotation_identifier, scope_external_identifier, customer_name, "
+            "departure, destination, shipment_type, request_json, response_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(gmail_message_id) DO NOTHING",
+            [
+                msg["id"],
+                msg.get("threadId"),
+                get_header(msg, "Subject"),
+                get_header(msg, "From"),
+                get_header(msg, "Date"),
+                quotation_id,
+                external_id,
+                request_payload.get("_customer_name_guess"),
+                json.dumps(request_payload.get("general", {}).get("departure", {}), ensure_ascii=False),
+                json.dumps(request_payload.get("general", {}).get("destination", {}), ensure_ascii=False),
+                request_payload.get("shipmentType"),
+                json.dumps(request_payload, ensure_ascii=False),
+                json.dumps(response_json, ensure_ascii=False),
+                now_iso(),
+            ],
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"  WAARSCHUWING: offerte {quotation_id} is aangemaakt in Scope, maar kon niet "
+              f"worden opgeslagen in Turso ({e}). Mail wordt toch als '{LABEL_DONE}' gelabeld "
+              f"om een dubbele offerte in Scope te voorkomen -- vul de rij zo nodig handmatig aan.")
 
 
 def save_error(client, msg, stage, error_message, request_payload=None, response_body=None):
-    client.execute(
-        "INSERT INTO quotation_errors (gmail_message_id, email_subject, email_from, error_stage, "
-        "error_message, request_json, response_body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-            msg["id"] if msg else None,
-            get_header(msg, "Subject") if msg else None,
-            get_header(msg, "From") if msg else None,
-            stage,
-            str(error_message)[:2000],
-            json.dumps(request_payload, ensure_ascii=False) if request_payload else None,
-            str(response_body)[:4000] if response_body else None,
-            now_iso(),
-        ],
-    )
+    try:
+        turso_exec(
+            client,
+            "INSERT INTO quotation_errors (gmail_message_id, email_subject, email_from, error_stage, "
+            "error_message, request_json, response_body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                msg["id"] if msg else None,
+                get_header(msg, "Subject") if msg else None,
+                get_header(msg, "From") if msg else None,
+                stage,
+                str(error_message)[:2000],
+                json.dumps(request_payload, ensure_ascii=False) if request_payload else None,
+                str(response_body)[:4000] if response_body else None,
+                now_iso(),
+            ],
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"  WAARSCHUWING: kon fout niet loggen in Turso ({e}); mail krijgt wel het "
+              f"'{LABEL_ERROR}'-label.")
 
 
 # --------------------------------------------------------------------------

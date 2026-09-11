@@ -65,6 +65,18 @@ turso db shell scope-orders "SELECT * FROM email_partner_map"
 dus schrijfwijze maakt niet uit -- wél moet het adres exact overeenkomen,
 zonder spaties ervoor/erna).
 
+## Turso-opslag & foutafhandeling
+
+Zodra een offerte succesvol in Scope is aangemaakt, proberen we 'm ook in
+Turso op te slaan (tabel `quotations`). Lukt dát onverhoopt niet (bijv. een
+tijdelijke Turso-storing), dan wordt dat alleen gelogd in de Actions-run --
+de mail krijgt **toch** het label `Offerte/Verwerkt`. Dat is bewust: de
+offerte staat al in Scope en is niet meer terug te draaien, dus opnieuw
+verwerken zou een **dubbele offerte in Scope** opleveren. Zie je zo'n
+waarschuwing in de log, controleer dan handmatig of de offerte in Turso
+staat en vul de rij zo nodig zelf aan (het genoemde
+`scope_quotation_identifier` staat in de log).
+
 ## Setup
 
 ### 1. Repo-secrets instellen
