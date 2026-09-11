@@ -209,6 +209,13 @@ def get_header(payload, name):
     return ""
 
 
+def extract_email_address(header_value):
+    """Haalt het kale e-mailadres uit een From-header als 'Naam <adres@x.nl>'
+    of gewoon 'adres@x.nl'. Lowercased, want de mapping-tabel matcht exact."""
+    m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", header_value or "")
+    return m.group(0).lower() if m else ""
+
+
 # --------------------------------------------------------------------------
 # Scope (Riege) -- partner-/salesperson-lookup + quotation-aanmaak
 # --------------------------------------------------------------------------
@@ -255,6 +262,42 @@ def find_partner_by_code(code):
     identifier = items[0].get("identifier")
     _owner_identifier_cache[code] = identifier
     return identifier
+
+
+def resolve_partner_for_email(turso, email_address):
+    """Betrouwbare manier om te bepalen wie de 'orderer' is: kijkt in de
+    handmatig onderhouden tabel email_partner_map (email_address ->
+    scope_partner_code). Als daar een rij voor bestaat maar de identifier
+    nog niet gecached is (of de code is gewijzigd), wordt die opgezocht via
+    de Partner-API en teruggeschreven, zodat volgende runs geen extra
+    API-call meer nodig hebben.
+
+    Retourneert (partner_identifier, partner_code) of (None, None) als er
+    geen mapping voor dit adres bestaat."""
+    if not email_address:
+        return None, None
+
+    rs = turso.execute(
+        "SELECT scope_partner_code, scope_partner_identifier FROM email_partner_map WHERE email_address = ?",
+        [email_address],
+    )
+    if not rs.rows:
+        return None, None
+
+    code, identifier = rs.rows[0][0], rs.rows[0][1]
+    if identifier:
+        return identifier, code
+
+    identifier = find_partner_by_code(code)
+    if identifier:
+        turso.execute(
+            "UPDATE email_partner_map SET scope_partner_identifier = ?, updated_at = ? WHERE email_address = ?",
+            [identifier, now_iso(), email_address],
+        )
+    else:
+        print(f"  mapping voor {email_address} verwijst naar partnercode {code!r}, "
+              f"maar die is niet gevonden via de Partner-API -- controleer de code.")
+    return identifier, code
 
 
 def find_partner_by_text(search_text):
@@ -560,12 +603,25 @@ def main():
         except Exception as e:  # noqa: BLE001
             print("  salesperson-lookup faalde (niet fataal):", e)
 
+        # Wie is de "orderer"? Eerst de betrouwbare weg: mailadres opzoeken
+        # in email_partner_map. Alleen als daar niets voor staat, terugvallen
+        # op het onzekere naam-matchen.
         try:
             prospect = payload_for_scope.get("general", {}).get("prospect", {})
-            search_text = f"{sender} {customer_guess or ''}"
-            partner_id = find_partner_by_text(search_text)
-            if partner_id and "partner" not in prospect:
+            sender_email = extract_email_address(sender)
+            partner_id, partner_code = resolve_partner_for_email(turso, sender_email)
+            if partner_id:
                 prospect.setdefault("partner", {})["identifier"] = partner_id
+                print(f"  orderer herkend via email_partner_map: {sender_email} -> {partner_code} ({partner_id})")
+            else:
+                if sender_email:
+                    print(f"  geen mapping voor {sender_email} in email_partner_map -- "
+                          f"voeg een rij toe (email_address, scope_partner_code) zodat dit "
+                          f"automatisch herkend wordt. Val voorlopig terug op naam-matchen.")
+                search_text = f"{sender} {customer_guess or ''}"
+                fallback_id = find_partner_by_text(search_text)
+                if fallback_id and "partner" not in prospect:
+                    prospect.setdefault("partner", {})["identifier"] = fallback_id
         except Exception as e:  # noqa: BLE001
             print("  partner-lookup faalde (niet fataal):", e)
 

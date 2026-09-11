@@ -33,3 +33,14 @@ CREATE TABLE IF NOT EXISTS quotation_errors (
     response_body TEXT,
     created_at TEXT NOT NULL
 );
+
+-- Wie is de "orderer"/klant achter een mailadres? Handmatig onderhouden
+-- (email_address + scope_partner_code invullen); scope_partner_identifier
+-- wordt door het script zelf via de Partner-API opgezocht en hier
+-- gecached zodra alleen de code bekend is.
+CREATE TABLE IF NOT EXISTS email_partner_map (
+    email_address TEXT PRIMARY KEY,
+    scope_partner_code TEXT NOT NULL,
+    scope_partner_identifier TEXT,
+    updated_at TEXT NOT NULL
+);

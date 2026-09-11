@@ -15,8 +15,9 @@ Scope/Turso-API's niet bereikbaar zijn vanuit de Claude-cloudomgeving.
    `Offerte/Fout`.
 2. Laat Claude (Anthropic API) de offerteaanvraag omzetten naar het JSON-formaat
    dat Scope's quotation-API verwacht (lucht/zee/weg, wat van toepassing is).
-3. Probeert de bekende klant (partner) en verkoper (salesperson) aan te vullen
-   via Scope's Partner-/Salesperson-API's -- best effort, geen harde eis.
+3. Bepaalt de "orderer" (klant/prospect) via de tabel `email_partner_map`
+   (zie hieronder) en vult de verkoper (salesperson) aan via Scope's
+   Salesperson-API -- best effort, geen harde eis.
 4. `POST`'t naar `/v1/quotations/` op je Scope-omgeving (Basic Auth).
    - **Gelukt:** offerte + ruwe request/response worden opgeslagen in Turso,
      mail krijgt label `Offerte/Verwerkt`.
@@ -24,15 +25,35 @@ Scope/Turso-API's niet bereikbaar zijn vanuit de Claude-cloudomgeving.
      krijgt label `Offerte/Fout` (zodat 'ie niet steeds opnieuw geprobeerd
      wordt -- voor handmatige controle).
 
-## Bekende beperking
+## Owner (verplicht veld)
 
-De voorbeeldschema's van Scope's quotation-API tonen geen "owner"-identifier
-(vestiging/branch) -- als Scope die verplicht stelt, zal de aanmaak in eerste
-instantie falen met een duidelijke foutmelding (terug te vinden in
-`quotation_errors.error_message` in Turso, of in de Actions-run-log). Zodra
-je de juiste owner-identifier hebt (te vinden in de Scope-UI, of vraag het
-Riege-support), kan die als extra stap aan `check_offertes.py` toegevoegd
-worden (`payload_for_scope["owner"] = {"identifier": "..."}`).
+Scope eist een `owner.identifier` op elke offerte ("Quotation's owner must be
+supplied"). Het script zoekt hiervoor automatisch de partner met code
+`SCORTM` op via de Partner-API en gebruikt diens `identifier`. Moet dit ooit
+een andere partnercode worden, zet dan de optionele repo-secret
+`SCOPE_OWNER_PARTNER_CODE` op de gewenste code.
+
+## Wie is de orderer? (`email_partner_map`)
+
+Scope moet weten welke bestaande klant (partner) een offerte aanvraagt. Dat
+lossen we op met een tabel in Turso die je zelf onderhoudt:
+
+| kolom | wie vult 'm |
+|---|---|
+| `email_address` | jij (het mailadres van de aanvrager, lowercase) |
+| `scope_partner_code` | jij (de partnercode zoals in Scope) |
+| `scope_partner_identifier` | het script zelf (via de Partner-API, gecached) |
+
+Een rij toevoegen kan via de Turso CLI:
+
+```bash
+turso db shell scope-orders "INSERT INTO email_partner_map (email_address, scope_partner_code, updated_at) VALUES ('klant@bedrijf.nl', 'BEDRIJFCODE', datetime('now'))"
+```
+
+(of vervang `'BEDRIJFCODE'` door de echte partnercode, en herhaal per
+klant-mailadres). Zonder mapping wordt teruggevallen op een onzekere
+naam-match, en zie je in de Actions-log een melding welk mailadres nog
+toegevoegd moet worden.
 
 ## Setup
 
