@@ -68,11 +68,24 @@ zonder spaties ervoor/erna).
 ## Schema-migratie
 
 `CREATE TABLE IF NOT EXISTS` doet niets als een tabel al bestaat -- ook niet
-als 'ie een ouder schema heeft (ontbrekende kolommen). Het script checkt dit
-daarom apart bij elke run (`PRAGMA table_info`) en voegt ontbrekende
-kolommen automatisch toe via `ALTER TABLE ... ADD COLUMN`, plus de
-UNIQUE-index op `quotations.gmail_message_id` die nodig is voor de
-duplicaat-check. Dit gebeurt stil in de log tenzij er iets ontbreekt.
+als 'ie een ouder schema heeft (ontbrekende kolommen, of juist extra
+verplichte kolommen die dit script niet kent). Het script checkt dit
+daarom apart bij elke run (`PRAGMA table_info`):
+
+- **Ontbrekende kolommen** die het script nodig heeft, worden automatisch
+  toegevoegd via `ALTER TABLE ... ADD COLUMN`, plus de UNIQUE-index op
+  `quotations.gmail_message_id` die nodig is voor de duplicaat-check.
+- **Onverwachte NOT NULL-kolommen** die al in de tabel bestaan (bijv. een
+  kolom uit een eerdere/andere versie van deze tabel, zoals `raw_json`)
+  worden bij het wegschrijven zelf automatisch gevuld met een neutrale
+  waarde (`{}` voor kolommen die op `_json` eindigen, anders een lege
+  string) zodat de INSERT nooit meer crasht op een kolom die het script
+  niet kent. Je ziet dit terug als een waarschuwing in de Actions-log --
+  overweeg zo'n rij later handmatig aan te vullen of de kolom een echte
+  default te geven.
+
+Dit gebeurt stil in de log tenzij er daadwerkelijk iets ontbreekt of
+opgevuld moest worden.
 
 ## Turso-opslag & foutafhandeling
 

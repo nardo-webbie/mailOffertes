@@ -598,6 +598,53 @@ def _migrate_missing_columns(client):
         print(f"  kon UNIQUE-index op quotations.gmail_message_id niet aanmaken/checken: {e}")
 
 
+def _table_columns(client, table):
+    """PRAGMA table_info(table) -> lijst van {name, notnull, default}."""
+    rs = turso_exec(client, f"PRAGMA table_info({table})")
+    return [
+        {"name": row["name"], "notnull": bool(row["notnull"]), "default": row["dflt_value"]}
+        for row in rs.rows
+    ]
+
+
+def _insert_row(client, table, known_values, on_conflict=None):
+    """Bouwt en voert een INSERT uit die zich aanpast aan het ECHTE schema van
+    `table` in Turso, i.p.v. blind te vertrouwen op schema.sql. Reden: de
+    live tabellen bleken al meermaals af te wijken van schema.sql (een
+    ontbrekende kolom, en een onverwachte NOT NULL kolom 'raw_json') --
+    CREATE TABLE IF NOT EXISTS migreert een bestaande tabel nooit.
+
+    - Kolommen uit `known_values` die ook echt in de tabel bestaan: die
+      waarde wordt geschreven.
+    - Overige kolommen die NOT NULL zijn zonder default (dus verplicht, maar
+      onbekend bij ons): krijgen een neutrale fallback ("{}" voor kolommen
+      die op '_json' eindigen, anders "") zodat de INSERT niet faalt -- met
+      een duidelijke waarschuwing in de log, want zo'n kolom hoort
+      waarschijnlijk een keer met een echte waarde gevuld te worden.
+    - Overige kolommen (nullable, onbekend): weggelaten -- krijgen NULL/hun
+      eigen default."""
+    columns = _table_columns(client, table)
+    col_names = {c["name"] for c in columns}
+    values = {name: val for name, val in known_values.items() if name in col_names}
+    for c in columns:
+        name = c["name"]
+        if name in values or not c["notnull"] or c["default"] is not None:
+            continue
+        if name.lower() == "id":  # autoincrement PK, nooit zelf invullen
+            continue
+        fallback = "{}" if name.lower().endswith("json") else ""
+        print(f"  tabel {table!r} heeft een onverwachte NOT NULL kolom {name!r} zonder "
+              f"default -- vul 'm met {fallback!r} zodat de INSERT niet faalt (overweeg "
+              f"de rij later handmatig aan te vullen of de kolom een default te geven).")
+        values[name] = fallback
+    cols_sql = ", ".join(values.keys())
+    placeholders = ", ".join("?" for _ in values)
+    sql = f"INSERT INTO {table} ({cols_sql}) VALUES ({placeholders})"
+    if on_conflict:
+        sql += f" {on_conflict}"
+    turso_exec(client, sql, list(values.values()))
+
+
 def save_success(client, msg, quotation_id, external_id, request_payload, response_json):
     """Slaat de offerte op in Turso. Als dit faalt (Turso-hik, netwerk, etc.)
     wordt de fout alleen GELOGD, niet doorgegooid: de offerte is namelijk al
@@ -607,30 +654,32 @@ def save_success(client, msg, quotation_id, external_id, request_payload, respon
     één offerte die (tijdelijk) niet in Turso staat dan een duplicaat in
     Scope. Bij zo'n waarschuwing: offerte handmatig in Turso natrekken/
     toevoegen aan de hand van het genoemde scope_quotation_identifier."""
+    request_json_str = json.dumps(request_payload, ensure_ascii=False)
     try:
-        turso_exec(
+        _insert_row(
             client,
-            "INSERT INTO quotations (gmail_message_id, gmail_thread_id, email_subject, email_from, "
-            "email_date, scope_quotation_identifier, scope_external_identifier, customer_name, "
-            "departure, destination, shipment_type, request_json, response_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(gmail_message_id) DO NOTHING",
-            [
-                msg["id"],
-                msg.get("threadId"),
-                get_header(msg, "Subject"),
-                get_header(msg, "From"),
-                get_header(msg, "Date"),
-                quotation_id,
-                external_id,
-                request_payload.get("_customer_name_guess"),
-                json.dumps(request_payload.get("general", {}).get("departure", {}), ensure_ascii=False),
-                json.dumps(request_payload.get("general", {}).get("destination", {}), ensure_ascii=False),
-                request_payload.get("shipmentType"),
-                json.dumps(request_payload, ensure_ascii=False),
-                json.dumps(response_json, ensure_ascii=False),
-                now_iso(),
-            ],
+            "quotations",
+            {
+                "gmail_message_id": msg["id"],
+                "gmail_thread_id": msg.get("threadId"),
+                "email_subject": get_header(msg, "Subject"),
+                "email_from": get_header(msg, "From"),
+                "email_date": get_header(msg, "Date"),
+                "scope_quotation_identifier": quotation_id,
+                "scope_external_identifier": external_id,
+                "customer_name": request_payload.get("_customer_name_guess"),
+                "departure": json.dumps(request_payload.get("general", {}).get("departure", {}), ensure_ascii=False),
+                "destination": json.dumps(request_payload.get("general", {}).get("destination", {}), ensure_ascii=False),
+                "shipment_type": request_payload.get("shipmentType"),
+                "request_json": request_json_str,
+                "response_json": json.dumps(response_json, ensure_ascii=False),
+                # 'raw_json' bestaat op sommige (oudere) versies van de live
+                # tabel als aparte, verplichte kolom -- vullen met dezelfde
+                # inhoud als request_json is de logische keus.
+                "raw_json": request_json_str,
+                "created_at": now_iso(),
+            },
+            on_conflict="ON CONFLICT(gmail_message_id) DO NOTHING",
         )
     except Exception as e:  # noqa: BLE001
         print(f"  WAARSCHUWING: offerte {quotation_id} is aangemaakt in Scope, maar kon niet "
@@ -640,20 +689,19 @@ def save_success(client, msg, quotation_id, external_id, request_payload, respon
 
 def save_error(client, msg, stage, error_message, request_payload=None, response_body=None):
     try:
-        turso_exec(
+        _insert_row(
             client,
-            "INSERT INTO quotation_errors (gmail_message_id, email_subject, email_from, error_stage, "
-            "error_message, request_json, response_body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                msg["id"] if msg else None,
-                get_header(msg, "Subject") if msg else None,
-                get_header(msg, "From") if msg else None,
-                stage,
-                str(error_message)[:2000],
-                json.dumps(request_payload, ensure_ascii=False) if request_payload else None,
-                str(response_body)[:4000] if response_body else None,
-                now_iso(),
-            ],
+            "quotation_errors",
+            {
+                "gmail_message_id": msg["id"] if msg else None,
+                "email_subject": get_header(msg, "Subject") if msg else None,
+                "email_from": get_header(msg, "From") if msg else None,
+                "error_stage": stage,
+                "error_message": str(error_message)[:2000],
+                "request_json": json.dumps(request_payload, ensure_ascii=False) if request_payload else None,
+                "response_body": str(response_body)[:4000] if response_body else None,
+                "created_at": now_iso(),
+            },
         )
     except Exception as e:  # noqa: BLE001
         print(f"  WAARSCHUWING: kon fout niet loggen in Turso ({e}); mail krijgt wel het "
