@@ -277,8 +277,13 @@ def resolve_partner_for_email(turso, email_address):
     if not email_address:
         return None, None
 
+    # email_address komt hier al lowercased binnen (extract_email_address),
+    # maar SQLite vergelijkt TEXT standaard hoofdlettergevoelig -- vergelijk
+    # daarom met lower() aan beide kanten, voor het geval de rij met een
+    # andere schrijfwijze is ingevoerd.
     rs = turso.execute(
-        "SELECT scope_partner_code, scope_partner_identifier FROM email_partner_map WHERE email_address = ?",
+        "SELECT scope_partner_code, scope_partner_identifier FROM email_partner_map "
+        "WHERE lower(email_address) = ?",
         [email_address],
     )
     if not rs.rows:
@@ -291,7 +296,8 @@ def resolve_partner_for_email(turso, email_address):
     identifier = find_partner_by_code(code)
     if identifier:
         turso.execute(
-            "UPDATE email_partner_map SET scope_partner_identifier = ?, updated_at = ? WHERE email_address = ?",
+            "UPDATE email_partner_map SET scope_partner_identifier = ?, updated_at = ? "
+            "WHERE lower(email_address) = ?",
             [identifier, now_iso(), email_address],
         )
     else:

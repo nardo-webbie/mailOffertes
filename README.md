@@ -55,6 +55,16 @@ klant-mailadres). Zonder mapping wordt teruggevallen op een onzekere
 naam-match, en zie je in de Actions-log een melding welk mailadres nog
 toegevoegd moet worden.
 
+Bestaande mappings controleren:
+
+```bash
+turso db shell scope-orders "SELECT * FROM email_partner_map"
+```
+
+(de vergelijking met het mailadres uit de mail is hoofdletterongevoelig,
+dus schrijfwijze maakt niet uit -- wél moet het adres exact overeenkomen,
+zonder spaties ervoor/erna).
+
 ## Setup
 
 ### 1. Repo-secrets instellen
