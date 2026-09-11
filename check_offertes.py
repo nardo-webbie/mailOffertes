@@ -279,17 +279,38 @@ def resolve_partner_for_email(turso, email_address):
 
     # email_address komt hier al lowercased binnen (extract_email_address),
     # maar SQLite vergelijkt TEXT standaard hoofdlettergevoelig -- vergelijk
-    # daarom met lower() aan beide kanten, voor het geval de rij met een
-    # andere schrijfwijze is ingevoerd.
+    # daarom met lower()+trim() aan beide kanten, voor het geval de rij met
+    # een andere schrijfwijze of onzichtbare spaties is ingevoerd.
+    # Let op: beide queries selecteren bewust dezelfde 3 kolommen in dezelfde
+    # volgorde (email_address, code, identifier), zodat de rest van de
+    # functie de rij hierna consistent kan indexeren ongeacht welke van de
+    # twee paden 'm vond.
+    cols = "email_address, scope_partner_code, scope_partner_identifier"
     rs = turso.execute(
-        "SELECT scope_partner_code, scope_partner_identifier FROM email_partner_map "
-        "WHERE lower(email_address) = ?",
+        f"SELECT {cols} FROM email_partner_map WHERE lower(trim(email_address)) = trim(?)",
         [email_address],
     )
-    if not rs.rows:
+    row = rs.rows[0] if rs.rows else None
+
+    if row is None:
+        # Nog steeds niks -- val terug op alle rijen ophalen en in Python
+        # normaliseren/vergelijken, en log precies wat er in de tabel staat
+        # zodat een eventuele mismatch (rare tekens, typo) meteen zichtbaar is.
+        all_rows = turso.execute(f"SELECT {cols} FROM email_partner_map")
+        print(f"  debug: {len(all_rows.rows)} rij(en) in email_partner_map, "
+              f"zoek naar {email_address!r}: " +
+              ", ".join(repr(r[0]) for r in all_rows.rows[:10]))
+        for r in all_rows.rows:
+            if r[0] and r[0].strip().lower() == email_address.strip().lower():
+                row = r
+                print(f"  (gevonden via Python-side normalisatie -- de opgeslagen waarde "
+                      f"{r[0]!r} wijkt net iets af van {email_address!r}, overweeg de rij te fixen)")
+                break
+
+    if row is None:
         return None, None
 
-    code, identifier = rs.rows[0][0], rs.rows[0][1]
+    code, identifier = row[1], row[2]
     if identifier:
         return identifier, code
 
