@@ -232,16 +232,17 @@ def scope_get(path, params=None):
     return r.json()
 
 
-_owner_identifier_cache = {}
+_partner_cache = {}  # code -> (identifier, name)
 
 
 def find_partner_by_code(code):
     """Exacte lookup via de Partner-API's 'code'-parameter (i.t.t.
     find_partner_by_text hieronder, dat alleen client-side op naam matcht).
     Gebruikt voor SCOPE_OWNER_PARTNER_CODE ('owner.identifier' -- Scope eist
-    dit veld op elke offerte)."""
-    if code in _owner_identifier_cache:
-        return _owner_identifier_cache[code]
+    dit veld op elke offerte) én om partner_name te vullen voor
+    portal_quotations. Retourneert (identifier, name), of (None, None)."""
+    if code in _partner_cache:
+        return _partner_cache[code]
     try:
         data = scope_get(
             "v4/partners",
@@ -253,38 +254,34 @@ def find_partner_by_code(code):
         )
     except requests.RequestException as e:
         print(f"  partner-lookup (code={code}) faalde:", e)
-        return None
+        return None, None
 
     items = data if isinstance(data, list) else data.get("partner") or data.get("partners") or []
     if not items:
         print(f"  partner met code {code!r} niet gevonden via Partner-API")
-        return None
+        return None, None
     identifier = items[0].get("identifier")
-    _owner_identifier_cache[code] = identifier
-    return identifier
+    name = items[0].get("name")
+    _partner_cache[code] = (identifier, name)
+    return identifier, name
 
 
 def resolve_partner_for_email(turso, email_address):
     """Betrouwbare manier om te bepalen wie de 'orderer' is: kijkt in de
     handmatig onderhouden tabel email_partner_map (email_address ->
-    scope_partner_code). Als daar een rij voor bestaat maar de identifier
-    nog niet gecached is (of de code is gewijzigd), wordt die opgezocht via
-    de Partner-API en teruggeschreven, zodat volgende runs geen extra
-    API-call meer nodig hebben.
+    scope_partner_code) en haalt daarna altijd de actuele identifier+naam
+    op via de Partner-API (zit na de eerste keer al in _partner_cache voor
+    deze run, dus geen extra kosten bij hergebruik binnen dezelfde code).
 
-    Retourneert (partner_identifier, partner_code) of (None, None) als er
-    geen mapping voor dit adres bestaat."""
+    Retourneert (partner_identifier, partner_code, partner_name) of
+    (None, None, None) als er geen mapping voor dit adres bestaat."""
     if not email_address:
-        return None, None
+        return None, None, None
 
     # email_address komt hier al lowercased binnen (extract_email_address),
     # maar SQLite vergelijkt TEXT standaard hoofdlettergevoelig -- vergelijk
     # daarom met lower()+trim() aan beide kanten, voor het geval de rij met
     # een andere schrijfwijze of onzichtbare spaties is ingevoerd.
-    # Let op: beide queries selecteren bewust dezelfde 3 kolommen in dezelfde
-    # volgorde (email_address, code, identifier), zodat de rest van de
-    # functie de rij hierna consistent kan indexeren ongeacht welke van de
-    # twee paden 'm vond.
     cols = "email_address, scope_partner_code, scope_partner_identifier"
     rs = turso_exec(
         turso,
@@ -309,31 +306,35 @@ def resolve_partner_for_email(turso, email_address):
                 break
 
     if row is None:
-        return None, None
+        return None, None, None
 
-    code, identifier = row[1], row[2]
-    if identifier:
-        return identifier, code
+    code, cached_identifier = row[1], row[2]
+    identifier, name = find_partner_by_code(code)
+    if not identifier:
+        identifier = cached_identifier  # val terug op de eerder gecachte identifier
+        name = None
+        if not identifier:
+            print(f"  mapping voor {email_address} verwijst naar partnercode {code!r}, "
+                  f"maar die is niet gevonden via de Partner-API -- controleer de code.")
+    elif identifier != cached_identifier:
+        try:
+            turso_exec(
+                turso,
+                "UPDATE email_partner_map SET scope_partner_identifier = ?, updated_at = ? "
+                "WHERE lower(email_address) = ?",
+                [identifier, now_iso(), email_address],
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"  kon scope_partner_identifier niet bijwerken in email_partner_map: {e}")
 
-    identifier = find_partner_by_code(code)
-    if identifier:
-        turso_exec(
-            turso,
-            "UPDATE email_partner_map SET scope_partner_identifier = ?, updated_at = ? "
-            "WHERE lower(email_address) = ?",
-            [identifier, now_iso(), email_address],
-        )
-    else:
-        print(f"  mapping voor {email_address} verwijst naar partnercode {code!r}, "
-              f"maar die is niet gevonden via de Partner-API -- controleer de code.")
-    return identifier, code
+    return identifier, code, name
 
 
 def find_partner_by_text(search_text):
     """Best-effort: haalt partners op (org/legal-entity-scoped) en matcht
     client-side op naam/e-maildomein, want de Partner-API biedt geen
-    vrije-tekst-zoekparameter. Retourneert het partner-'identifier'-veld
-    of None als er niets overtuigends gevonden wordt."""
+    vrije-tekst-zoekparameter. Retourneert (identifier, name, code), of
+    (None, None, None) als er niets overtuigends gevonden wordt."""
     try:
         data = scope_get(
             "v4/partners",
@@ -344,36 +345,39 @@ def find_partner_by_text(search_text):
             },
         )
     except requests.RequestException:
-        return None
+        return None, None, None
 
     items = data if isinstance(data, list) else data.get("partner") or data.get("partners") or []
     needle = (search_text or "").lower()
     if not needle:
-        return None
+        return None, None, None
     for p in items:
         name = (p.get("name") or "").lower()
         if name and name in needle:
-            return p.get("identifier") or p.get("code")
-    return None
+            return p.get("identifier"), p.get("name"), p.get("code")
+    return None, None, None
 
 
 def find_salesperson_identifier(hint=SCOPE_USER):
+    """Retourneert (identifier, volledige naam) van de best passende
+    salesperson, of (None, None) als er geen match is."""
     try:
         data = scope_get(
             "v1/salespersons",
             params={"organizationCode": SCOPE_ORGANIZATION_CODE, "size": 1000},
         )
     except requests.RequestException:
-        return None
+        return None, None
     items = data if isinstance(data, list) else data.get("salesperson") or data.get("salespersons") or []
-    hint = (hint or "").lower()
+    hint_l = (hint or "").lower()
     for sp in items:
-        name = f"{sp.get('firstName', '')} {sp.get('lastName', '')} {sp.get('code', '')}".lower()
-        if hint and hint in name:
-            return sp.get("identifier")
+        first, last = sp.get("firstName", ""), sp.get("lastName", "")
+        name = f"{first} {last} {sp.get('code', '')}".lower()
+        if hint_l and hint_l in name:
+            return sp.get("identifier"), f"{first} {last}".strip()
     # Geen match: laat het veld leeg -- Scope vult evt. een default,
     # of de aanmaak faalt met een duidelijke foutmelding die we loggen.
-    return None
+    return None, None
 
 
 def create_quotation(payload):
@@ -539,19 +543,26 @@ def ensure_schema(client):
     for stmt in [s.strip() for s in cleaned.split(";") if s.strip()]:
         turso_exec(client, stmt)
     _migrate_missing_columns(client)
+    _ensure_create_method_column(client)
 
 
 # CREATE TABLE IF NOT EXISTS is een no-op zodra de tabel al bestaat -- ook
 # als 'ie een ouder/afwijkend schema heeft (bijv. van vóór een latere kolom
-# werd toegevoegd aan schema.sql). Dat gaf precies dit soort fout: "table
-# quotations has no column named gmail_message_id". Daarom hier expliciet
-# elke verwachte kolom nalopen en ontbrekende kolommen alsnog toevoegen.
+# werd toegevoegd aan schema.sql). Daarom hier expliciet elke verwachte
+# kolom nalopen en ontbrekende kolommen alsnog toevoegen.
+#
+# 'portal_quotations' is de tabel die de Scope Customer Portal zelf ook
+# gebruikt (zie schema.sql) -- MailOfferte schrijft daar nu rechtstreeks in
+# (i.p.v. een eigen losse 'quotations'-tabel), zodat per mail aangemaakte
+# offertes ook in de portal-zoekfunctie verschijnen. 'create_method' (Mail/
+# Portal) staat er apart onder, want die kolom wil een DEFAULT hebben voor
+# bestaande rijen (zie _ensure_create_method_column).
 _EXPECTED_COLUMNS = {
-    "quotations": [
-        "gmail_message_id", "gmail_thread_id", "email_subject", "email_from",
-        "email_date", "scope_quotation_identifier", "scope_external_identifier",
-        "customer_name", "departure", "destination", "shipment_type",
-        "request_json", "response_json", "created_at",
+    "portal_quotations": [
+        "identifier", "number", "external_identifier", "shipment_type", "status",
+        "partner_code", "partner_name", "contact_name", "contact_email",
+        "departure", "destination", "salesperson_name", "currency",
+        "created_by_user_id", "created_by_naam", "quotation_json", "created_at",
     ],
     "quotation_errors": [
         "gmail_message_id", "email_subject", "email_from", "error_stage",
@@ -583,19 +594,27 @@ def _migrate_missing_columns(client):
             except Exception as e:  # noqa: BLE001
                 print(f"  ALTER TABLE {table} ADD COLUMN {col} mislukte: {e}")
 
-    # save_success() gebruikt "ON CONFLICT(gmail_message_id) DO NOTHING",
-    # wat een UNIQUE-index op die kolom vereist. Als gmail_message_id via
-    # ALTER TABLE is toegevoegd (zie hierboven), komt die niet automatisch
-    # met de UNIQUE-constraint uit schema.sql mee -- dus die index hier
-    # expliciet en idempotent afdwingen.
+
+def _ensure_create_method_column(client):
+    """Voegt 'create_method' (Mail/Portal) toe aan portal_quotations als 'ie
+    er nog niet is. Los van _migrate_missing_columns omdat deze kolom een
+    DEFAULT nodig heeft: bestaande (door de portal zelf aangemaakte) rijen
+    moeten met terugwerkende kracht 'Portal' krijgen, en toekomstige inserts
+    vanuit de portal zelf (die deze kolom niet kennen) moeten niet breken
+    op een NOT NULL zonder default."""
     try:
-        turso_exec(
-            client,
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_quotations_gmail_message_id "
-            "ON quotations(gmail_message_id)",
-        )
+        rs = turso_exec(client, "PRAGMA table_info(portal_quotations)")
     except Exception as e:  # noqa: BLE001
-        print(f"  kon UNIQUE-index op quotations.gmail_message_id niet aanmaken/checken: {e}")
+        print(f"  kon schema van portal_quotations niet opvragen ({e}), create_method-migratie overgeslagen.")
+        return
+    if "create_method" in {row["name"] for row in rs.rows}:
+        return
+    print("  tabel 'portal_quotations' mist kolom 'create_method' -- voeg toe "
+          "(bestaande rijen worden met terugwerkende kracht 'Portal').")
+    try:
+        turso_exec(client, "ALTER TABLE portal_quotations ADD COLUMN create_method TEXT NOT NULL DEFAULT 'Portal'")
+    except Exception as e:  # noqa: BLE001
+        print(f"  ALTER TABLE portal_quotations ADD COLUMN create_method mislukte: {e}")
 
 
 def _table_columns(client, table):
@@ -645,46 +664,80 @@ def _insert_row(client, table, known_values, on_conflict=None):
     turso_exec(client, sql, list(values.values()))
 
 
-def save_success(client, msg, quotation_id, external_id, request_payload, response_json):
-    """Slaat de offerte op in Turso. Als dit faalt (Turso-hik, netwerk, etc.)
-    wordt de fout alleen GELOGD, niet doorgegooid: de offerte is namelijk al
-    aangemaakt in Scope (niet meer terug te draaien), dus als we hier zouden
-    crashen blijft de mail ongelabeld en wordt 'ie bij de volgende run
-    opnieuw verwerkt -- met een DUBBELE offerte in Scope tot gevolg. Beter
-    één offerte die (tijdelijk) niet in Turso staat dan een duplicaat in
-    Scope. Bij zo'n waarschuwing: offerte handmatig in Turso natrekken/
-    toevoegen aan de hand van het genoemde scope_quotation_identifier."""
-    request_json_str = json.dumps(request_payload, ensure_ascii=False)
+def _place_label(place):
+    """Bouwt een leesbaar label voor een Scope 'departure'/'destination'-
+    object (unlocode/iataCode + name, wat aanwezig is) -- portal_quotations
+    heeft hiervoor platte TEXT-kolommen, geen JSON."""
+    if not isinstance(place, dict):
+        return ""
+    code = place.get("unlocode") or place.get("iataCode")
+    name = place.get("name")
+    if code and name:
+        return f"{code} - {name}"
+    return code or name or ""
+
+
+def save_success(client, msg, quotation_id, external_id, request_payload, response_json,
+                  partner_code=None, partner_name=None, salesperson_name=None):
+    """Slaat de offerte op in 'portal_quotations' -- dezelfde tabel die de
+    Scope Customer Portal zelf gebruikt -- zodat een per mail aangemaakte
+    offerte ook meteen in de portal-zoekfunctie verschijnt, naast door de
+    portal zelf aangemaakte offertes. 'create_method' onderscheidt de
+    herkomst ('Mail' vs. 'Portal').
+
+    Als dit faalt (Turso-hik, netwerk, etc.) wordt de fout alleen GELOGD,
+    niet doorgegooid: de offerte is namelijk al aangemaakt in Scope (niet
+    meer terug te draaien), dus als we hier zouden crashen blijft de mail
+    ongelabeld en wordt 'ie bij de volgende run opnieuw verwerkt -- met een
+    DUBBELE offerte in Scope tot gevolg. Beter één offerte die (tijdelijk)
+    niet in Turso staat dan een duplicaat in Scope. Bij zo'n waarschuwing:
+    offerte handmatig in Turso natrekken/toevoegen aan de hand van het
+    genoemde identifier."""
+    if not quotation_id:
+        print("  WAARSCHUWING: Scope gaf geen quotation-identifier terug -- kan de offerte "
+              "niet opslaan in portal_quotations (identifier is de primary key). Controleer "
+              "de Scope-response handmatig.")
+        return
+
+    general = request_payload.get("general", {}) or {}
+    contact = general.get("prospect", {}).get("contact", {}) or {}
+
     try:
         _insert_row(
             client,
-            "quotations",
+            "portal_quotations",
             {
-                "gmail_message_id": msg["id"],
-                "gmail_thread_id": msg.get("threadId"),
-                "email_subject": get_header(msg, "Subject"),
-                "email_from": get_header(msg, "From"),
-                "email_date": get_header(msg, "Date"),
-                "scope_quotation_identifier": quotation_id,
-                "scope_external_identifier": external_id,
-                "customer_name": request_payload.get("_customer_name_guess"),
-                "departure": json.dumps(request_payload.get("general", {}).get("departure", {}), ensure_ascii=False),
-                "destination": json.dumps(request_payload.get("general", {}).get("destination", {}), ensure_ascii=False),
+                "identifier": quotation_id,
+                "number": response_json.get("number"),
+                # 'PORTAL-<timestamp>' is de portal-eigen conventie voor
+                # externalIdentifier; 'MAIL-<gmail_message_id>' volgt
+                # hetzelfde patroon en blijft herleidbaar naar de bron-mail.
+                "external_identifier": external_id or f"MAIL-{msg['id']}",
                 "shipment_type": request_payload.get("shipmentType"),
-                "request_json": request_json_str,
-                "response_json": json.dumps(response_json, ensure_ascii=False),
-                # 'raw_json' bestaat op sommige (oudere) versies van de live
-                # tabel als aparte, verplichte kolom -- vullen met dezelfde
-                # inhoud als request_json is de logische keus.
-                "raw_json": request_json_str,
+                "status": response_json.get("status"),
+                "partner_code": partner_code or "",
+                "partner_name": partner_name,
+                "contact_name": contact.get("name"),
+                "contact_email": contact.get("emailAddress"),
+                "departure": _place_label(general.get("departure")),
+                "destination": _place_label(general.get("destination")),
+                "salesperson_name": salesperson_name,
+                "currency": request_payload.get("calculation", {}).get("currency"),
+                "quotation_json": json.dumps(response_json, ensure_ascii=False),
                 "created_at": now_iso(),
+                "create_method": "Mail",
             },
-            on_conflict="ON CONFLICT(gmail_message_id) DO NOTHING",
+            on_conflict="ON CONFLICT(identifier) DO NOTHING",
         )
+        if not partner_code:
+            print(f"  WAARSCHUWING: offerte {quotation_id} opgeslagen zonder partner_code "
+                  f"(portal kan 'm dan niet aan een klant tonen) -- voeg een mapping toe in "
+                  f"email_partner_map voor de afzender van deze mail.")
     except Exception as e:  # noqa: BLE001
         print(f"  WAARSCHUWING: offerte {quotation_id} is aangemaakt in Scope, maar kon niet "
-              f"worden opgeslagen in Turso ({e}). Mail wordt toch als '{LABEL_DONE}' gelabeld "
-              f"om een dubbele offerte in Scope te voorkomen -- vul de rij zo nodig handmatig aan.")
+              f"worden opgeslagen in portal_quotations ({e}). Mail wordt toch als "
+              f"'{LABEL_DONE}' gelabeld om een dubbele offerte in Scope te voorkomen -- vul "
+              f"de rij zo nodig handmatig aan.")
 
 
 def save_error(client, msg, stage, error_message, request_payload=None, response_body=None):
@@ -758,7 +811,7 @@ def main():
         # Owner is verplicht ("Quotation's owner must be supplied") -- Scope
         # koppelt dit aan de partnercode SCOPE_OWNER_PARTNER_CODE (SCORTM).
         try:
-            owner_id = find_partner_by_code(SCOPE_OWNER_PARTNER_CODE)
+            owner_id, _owner_name = find_partner_by_code(SCOPE_OWNER_PARTNER_CODE)
             if owner_id:
                 payload_for_scope["owner"] = {"identifier": owner_id}
             else:
@@ -766,9 +819,11 @@ def main():
         except Exception as e:  # noqa: BLE001
             print("  owner-lookup faalde (niet fataal, maar Scope zal waarschijnlijk afwijzen):", e)
 
-        # Best-effort aanvullen van bekende klant/verkoper.
+        # Best-effort aanvullen van bekende verkoper (identifier voor Scope,
+        # naam voor de salesperson_name-kolom in portal_quotations).
+        salesperson_name = None
         try:
-            sp_id = find_salesperson_identifier()
+            sp_id, salesperson_name = find_salesperson_identifier()
             if sp_id:
                 payload_for_scope.setdefault("salesperson", {})["identifier"] = sp_id
         except Exception as e:  # noqa: BLE001
@@ -776,11 +831,15 @@ def main():
 
         # Wie is de "orderer"? Eerst de betrouwbare weg: mailadres opzoeken
         # in email_partner_map. Alleen als daar niets voor staat, terugvallen
-        # op het onzekere naam-matchen.
+        # op het onzekere naam-matchen. partner_code/partner_name worden ook
+        # gebruikt om portal_quotations te vullen (partner_code is daar
+        # verplicht, voor autorisatie bij zoeken in de portal).
+        partner_code = None
+        partner_name = None
         try:
             prospect = payload_for_scope.get("general", {}).get("prospect", {})
             sender_email = extract_email_address(sender)
-            partner_id, partner_code = resolve_partner_for_email(turso, sender_email)
+            partner_id, partner_code, partner_name = resolve_partner_for_email(turso, sender_email)
             if partner_id:
                 prospect.setdefault("partner", {})["identifier"] = partner_id
                 print(f"  orderer herkend via email_partner_map: {sender_email} -> {partner_code} ({partner_id})")
@@ -790,9 +849,11 @@ def main():
                           f"voeg een rij toe (email_address, scope_partner_code) zodat dit "
                           f"automatisch herkend wordt. Val voorlopig terug op naam-matchen.")
                 search_text = f"{sender} {customer_guess or ''}"
-                fallback_id = find_partner_by_text(search_text)
+                fallback_id, fallback_name, fallback_code = find_partner_by_text(search_text)
                 if fallback_id and "partner" not in prospect:
                     prospect.setdefault("partner", {})["identifier"] = fallback_id
+                    partner_name = fallback_name
+                    partner_code = fallback_code
         except Exception as e:  # noqa: BLE001
             print("  partner-lookup faalde (niet fataal):", e)
 
@@ -820,6 +881,9 @@ def main():
                 payload_for_scope.get("externalIdentifier"),
                 {**payload_for_scope, "_customer_name_guess": customer_guess, "_shipment_summary": summary},
                 resp_json,
+                partner_code=partner_code,
+                partner_name=partner_name,
+                salesperson_name=salesperson_name,
             )
             gmail.modify_labels(msg_id, add=[label_ids[LABEL_DONE]])
         else:
