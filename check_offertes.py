@@ -538,6 +538,64 @@ def ensure_schema(client):
     cleaned = "\n".join(lines)
     for stmt in [s.strip() for s in cleaned.split(";") if s.strip()]:
         turso_exec(client, stmt)
+    _migrate_missing_columns(client)
+
+
+# CREATE TABLE IF NOT EXISTS is een no-op zodra de tabel al bestaat -- ook
+# als 'ie een ouder/afwijkend schema heeft (bijv. van vóór een latere kolom
+# werd toegevoegd aan schema.sql). Dat gaf precies dit soort fout: "table
+# quotations has no column named gmail_message_id". Daarom hier expliciet
+# elke verwachte kolom nalopen en ontbrekende kolommen alsnog toevoegen.
+_EXPECTED_COLUMNS = {
+    "quotations": [
+        "gmail_message_id", "gmail_thread_id", "email_subject", "email_from",
+        "email_date", "scope_quotation_identifier", "scope_external_identifier",
+        "customer_name", "departure", "destination", "shipment_type",
+        "request_json", "response_json", "created_at",
+    ],
+    "quotation_errors": [
+        "gmail_message_id", "email_subject", "email_from", "error_stage",
+        "error_message", "request_json", "response_body", "created_at",
+    ],
+    "email_partner_map": [
+        "email_address", "scope_partner_code", "scope_partner_identifier", "updated_at",
+    ],
+}
+
+
+def _migrate_missing_columns(client):
+    for table, expected_cols in _EXPECTED_COLUMNS.items():
+        try:
+            rs = turso_exec(client, f"PRAGMA table_info({table})")
+        except Exception as e:  # noqa: BLE001
+            print(f"  kon schema van tabel {table!r} niet opvragen ({e}), migratie overgeslagen.")
+            continue
+        existing_cols = {row["name"] for row in rs.rows}
+        for col in expected_cols:
+            if col in existing_cols:
+                continue
+            print(f"  tabel {table!r} mist kolom {col!r} (ouder schema) -- voeg toe via ALTER TABLE.")
+            try:
+                # Generieke TEXT-kolom zonder NOT NULL/default: SQLite/libSQL
+                # is toch dynamisch getypeerd, en een NOT NULL-kolom zonder
+                # default zou falen als de tabel al rijen bevat.
+                turso_exec(client, f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+            except Exception as e:  # noqa: BLE001
+                print(f"  ALTER TABLE {table} ADD COLUMN {col} mislukte: {e}")
+
+    # save_success() gebruikt "ON CONFLICT(gmail_message_id) DO NOTHING",
+    # wat een UNIQUE-index op die kolom vereist. Als gmail_message_id via
+    # ALTER TABLE is toegevoegd (zie hierboven), komt die niet automatisch
+    # met de UNIQUE-constraint uit schema.sql mee -- dus die index hier
+    # expliciet en idempotent afdwingen.
+    try:
+        turso_exec(
+            client,
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_quotations_gmail_message_id "
+            "ON quotations(gmail_message_id)",
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"  kon UNIQUE-index op quotations.gmail_message_id niet aanmaken/checken: {e}")
 
 
 def save_success(client, msg, quotation_id, external_id, request_payload, response_json):

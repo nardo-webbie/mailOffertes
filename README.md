@@ -65,6 +65,15 @@ turso db shell scope-orders "SELECT * FROM email_partner_map"
 dus schrijfwijze maakt niet uit -- wél moet het adres exact overeenkomen,
 zonder spaties ervoor/erna).
 
+## Schema-migratie
+
+`CREATE TABLE IF NOT EXISTS` doet niets als een tabel al bestaat -- ook niet
+als 'ie een ouder schema heeft (ontbrekende kolommen). Het script checkt dit
+daarom apart bij elke run (`PRAGMA table_info`) en voegt ontbrekende
+kolommen automatisch toe via `ALTER TABLE ... ADD COLUMN`, plus de
+UNIQUE-index op `quotations.gmail_message_id` die nodig is voor de
+duplicaat-check. Dit gebeurt stil in de log tenzij er iets ontbreekt.
+
 ## Turso-opslag & foutafhandeling
 
 Zodra een offerte succesvol in Scope is aangemaakt, proberen we 'm ook in
